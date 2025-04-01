@@ -15,34 +15,27 @@ class ParameterComponentModel(torch.nn.Module):
         for c in range(n_components):
             nn.init.kaiming_normal_(self.W_enc[c])
             
-        if encoder_bias is None:
-            self.b_enc = torch.nn.Parameter(torch.zeros(n_components, hidden_dim))   
-        else:
-            self.b_enc = encoder_bias.clone()
-        if decoder_bias is None:
-            self.b_dec = torch.nn.Parameter(torch.zeros(n_components, output_dim))
-        else:
-            self.b_dec = decoder_bias.clone()
+        self.b_enc = torch.nn.Parameter(torch.zeros(hidden_dim)) if encoder_bias is None else encoder_bias.clone()
+        self.b_dec = torch.nn.Parameter(torch.zeros(output_dim)) if decoder_bias is None else decoder_bias.clone()
         self.relu = torch.nn.ReLU()
 
     @property
     def W_dec(self):
         # Tie decoder weights to transposed encoder weights
         return torch.transpose(self.W_enc, 1, 2)
-
-    def forward(self, input: torch.Tensor, component_mask: torch.Tensor | None = None):
+    
+    def get_reconstructed_weights(self, component_mask: torch.Tensor | None = None):
         if component_mask is None:
-            component_mask = torch.ones(self.n_components, dtype=torch.long)
-
+            component_mask = torch.ones(self.n_components, dtype=torch.float)
         reconstructed_W_enc = einops.einsum(self.W_enc, component_mask, "c i j, c -> i j")
-        reconstructed_b_enc = einops.einsum(self.b_enc, component_mask, "c i, c -> i")
-        # Use the property to get transposed weights
-        W_dec = self.W_dec
-        reconstructed_W_dec = einops.einsum(W_dec, component_mask, "c i j, c -> i j")
-        reconstructed_b_dec = einops.einsum(self.b_dec, component_mask, "c i, c -> i")
+        reconstructed_W_dec = einops.einsum(self.W_dec, component_mask, "c i j, c -> i j")
+        return reconstructed_W_enc, reconstructed_W_dec
 
-        x = input @ reconstructed_W_enc + reconstructed_b_enc
-        return self.relu(x @ reconstructed_W_dec + reconstructed_b_dec)
+    
+    def forward(self, input_BF: torch.Tensor, component_mask: torch.Tensor | None = None):
+        reconstructed_W_enc, reconstructed_W_dec = self.get_reconstructed_weights(component_mask)
+        x = input_BF @ reconstructed_W_enc + self.b_enc
+        return self.relu(x @ reconstructed_W_dec + self.b_dec)
 
 # %%
 def generate_batch(batch_size: int, n_features: int, feature_probability: float) -> torch.Tensor:
@@ -66,6 +59,7 @@ hidden_dim = 2
 lr = 1e-4
 num_steps = 20000
 sparsity = 0.2
+# n_components = 1
 
 target_model = ParameterComponentModel(1, n_features, hidden_dim, n_features)
 optimizer = torch.optim.Adam(target_model.parameters(), lr=lr)
@@ -104,6 +98,75 @@ print(test_output)
 error = (test_batch - test_output)
 px.imshow(error.detach().numpy())
 
+
+# %%
+n_components = 5
+reparameterized_model = ParameterComponentModel(2, n_features, hidden_dim, n_features, encoder_bias=target_model.b_enc, decoder_bias=target_model.b_dec)
+
+def L_faithfulness(train_model: ParameterComponentModel, target_model: ParameterComponentModel):
+    train_W_enc, train_W_dec = train_model.get_reconstructed_weights()
+    criterion = torch.nn.MSELoss()
+    loss = criterion(train_W_enc, target_model.W_enc) + criterion(train_W_dec, target_model.W_dec)
+    return loss
+
+def L_simplicity(parameter_model, active_component_mask, p=0.9):
+    # Extract active components
+    n_components = parameter_model.n_components
+    W_enc = parameter_model.W_enc  # [n_components, input_dim, hidden_dim]
+    
+    # Implement Schatten-p norm for each active component
+    simplicity_loss = 0.0
+    
+    for c in range(n_components):
+        if active_component_mask[c] > 0:
+            comp_W_enc = W_enc[c]
+            
+            # Using the formulation from Equation 21 and 22
+            # λ_c,l,m = (Σ_i,j U²_c,l,m,i V²_c,l,m,j)^(1/2)
+            # Where U and V correspond to the factors of our component
+            
+            # For autoencoder architecture, we have W_enc and W_dec (tied weights)
+            # We can use the singular value power method to avoid full SVD
+            # For simplicity, we'll use a vectorized approximation
+            
+            # Calculate U²_c,l,m,i and V²_c,l,m,j
+            U_squared = torch.sum(comp_W_enc**2, dim=1)  # [input_dim]
+            V_squared = torch.sum(comp_W_enc**2, dim=0)  # [hidden_dim]
+            
+            # Outer product approximation of singular values squared
+            singular_values_squared = torch.outer(U_squared, V_squared)  # [input_dim, hidden_dim]
+            print(singular_values_squared.shape)
+            
+            # Apply p/2 power to approximate Schatten norm as in Equation 22
+            schatten_p_norm = torch.sum(singular_values_squared**(p/2))
+            
+            simplicity_loss += schatten_p_norm
+    
+    return simplicity_loss
+
+def L_simplicity_2(parameter_model, active_component_mask, p=0.9):
+    n_components = parameter_model.n_components
+    W_enc = parameter_model.W_enc  # [n_components, input_dim, hidden_dim]
+    
+    simplicity_loss = 0.0
+    for c in range(n_components):
+        if active_component_mask[c] > 0:
+            comp_W_enc = W_enc[c]
+            _, S, _ = comp_W_enc.svd()
+            schatten_p_norm = S.norm(p=p)
+            simplicity_loss += schatten_p_norm
+    return simplicity_loss
+
+
+def L_minimality(model: ParameterComponentModel, input: torch.Tensor):
+    # TODO
+    return 0
+
+# %%
+print(L_faithfulness(reparameterized_model, target_model))
+print(L_simplicity(reparameterized_model, torch.ones(n_components)))  # Claude
+print(L_simplicity_2(reparameterized_model, torch.ones(n_components)))  # Me
+# TODO: why are these different? ^
 
 # %%
 assert False
